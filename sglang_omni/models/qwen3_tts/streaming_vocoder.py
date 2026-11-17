@@ -33,6 +33,11 @@ from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.qwen3_tts.xpu_length_buckets import (
+    install_length_buckets,
+    install_stream_windows,
+    warm_decoder_shapes,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
 from sglang_omni.profiler.event_recorder import (
@@ -823,6 +828,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         self.tokenizer = tokenizer
         self.device = torch.device(device)
         self.decoder = tokenizer.model.decoder
+        if self.device.type == "xpu":
+            install_length_buckets(self.decoder)
+        else:
+            pass
         parameters = getattr(self.decoder, "parameters", None)
         parameter = next(parameters(), None) if callable(parameters) else None
         codec_state_dtype = parameter.dtype if parameter is not None else torch.float32
@@ -871,6 +880,10 @@ class Qwen3TTSStreamingVocoderScheduler(
             if self.enable_stateful_codec_decoder
             else None
         )
+        if self.device.type == "xpu" and self.incremental_decoder is not None:
+            install_stream_windows(self.incremental_decoder)
+        else:
+            pass
         graph_frames = decode_graph_frame_counts(
             left_context=int(stream_left_context_frames),
             initial_chunk_frames=int(initial_chunk_frames),
@@ -1433,6 +1446,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         # note (Hao Wang): Engine initialization changes Torch's thread-count guard after factory warmup.
         if QTTS_BACKEND == "cutedsl":
             warmup_cutedsl_fallbacks(self.decoder)
+        else:
+            pass
+        if self.device.type == "xpu":
+            warm_decoder_shapes(self.decoder, self.incremental_decoder, self.device)
         else:
             pass
 
