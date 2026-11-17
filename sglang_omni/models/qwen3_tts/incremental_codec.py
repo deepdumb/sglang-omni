@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
@@ -28,10 +29,35 @@ from sglang_omni.utils.merged_projections import merge_projection_weights
 
 rmsnorm = current_platform.get_rmsnorm()
 
+# Opt-in on XPU (experimental): "transformer" and/or "conv", comma separated.
+XPU_FUSED_CODEC = frozenset(
+    part
+    for part in os.environ.get("SGLANG_OMNI_XPU_FUSED_CODEC", "").split(",")
+    if part and current_platform.is_xpu()
+)
+HAS_CODEC_KERNELS = current_platform.is_cuda() or bool(XPU_FUSED_CODEC)
+
 if current_platform.is_cuda():
     from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
     from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+else:
+    flash_attn_with_kvcache = None
 
+    def _is_fa3_supported() -> bool:  # noqa: leading-underscore
+        return False
+
+if "transformer" in XPU_FUSED_CODEC:
+    # The SYCL builds of the kernels the fused transformer calls.
+    from sgl_kernel import silu_and_mul  # noqa: F811
+    from sgl_kernel.jit.rope import (  # noqa: F811
+        apply_rope_inplace,
+        apply_rope_inplace_with_kvcache,
+    )
+else:
+    pass
+
+
+if HAS_CODEC_KERNELS:
     from sglang_omni.kernels.bias_snake_beta import (
         SnakeBetaCoefficients,
         fused_bias_snake_beta,
@@ -348,7 +374,7 @@ def bias_snake_beta_sum_tensors(
     )
 
 
-if current_platform.is_cuda():
+if HAS_CODEC_KERNELS:
     # note (ratish): as opaque ops, a trace runs no Triton front end on these kernels, and
     # Inductor writes the views they fill in place instead of cloning and copying each back.
     compiled_history_exchange = register_custom_op(
@@ -750,7 +776,7 @@ def ring_step_rows_fake(
     )
 
 
-if current_platform.is_cuda():
+if HAS_CODEC_KERNELS:
     # note (ratish): FA3 has no fake implementation, so a compiled decode calls it as this op.
     compiled_ring_window_attention = register_custom_op(
         ring_window_attention,
@@ -853,6 +879,17 @@ class FusedIncrementalTransformer:
         """SDPA of (B, heads, L, head_dim) queries over (B, kv_heads, S, head_dim) keys and
         values under a (B, 1, L, S) mask, as (B * L, heads * head_dim)."""
         attention = layer.self_attn
+        # torch 2.14.0+xpu: SDPA over exactly 16 queries and more than 64 keys of 64-wide
+        # half-precision heads returns NaN or writes outside its output (see
+        # sdpa_min_repro.py); a 17th query, dropped afterwards, takes another kernel path.
+        pads_query = query.device.type == "xpu" and int(query.shape[2]) == 16
+        if pads_query:
+            query = torch.cat((query, query[:, :, -1:]), dim=2)
+            attention_mask = torch.cat(
+                (attention_mask, attention_mask[:, :, -1:]), dim=2
+            )
+        else:
+            pass
         attended = F.scaled_dot_product_attention(
             query,
             keys,
@@ -861,6 +898,10 @@ class FusedIncrementalTransformer:
             scale=float(attention.scaling),
             enable_gqa=int(attention.num_key_value_groups) > 1,
         )
+        if pads_query:
+            attended = attended[:, :, :16]
+        else:
+            pass
         return attended.transpose(1, 2).reshape(
             -1, int(attended.shape[1]) * int(attended.shape[3])
         )
@@ -1316,8 +1357,13 @@ class Qwen3TTSIncrementalDecoder:
             self.snake_coefficients = {}
         transformer_weight = decoder.pre_transformer.input_proj.weight
         if (
-            current_platform.is_cuda()
-            and transformer_weight.device.type == "cuda"
+            (
+                (current_platform.is_cuda() and transformer_weight.device.type == "cuda")
+                or (
+                    "transformer" in XPU_FUSED_CODEC
+                    and transformer_weight.device.type == "xpu"
+                )
+            )
             and transformer_weight.dtype in (torch.bfloat16, torch.float16)
         ):
             self.fused_transformer: FusedIncrementalTransformer | None = (

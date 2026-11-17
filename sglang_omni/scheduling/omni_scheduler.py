@@ -3316,6 +3316,9 @@ class OmniScheduler(Generic[RequestDataT]):
             }
 
     def process_admin_requests(self) -> int:
+        from sglang_omni.profiler import thread_hook as _th
+
+        _th.poll()
         processed = 0
         while True:
             try:

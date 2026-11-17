@@ -163,5 +163,6 @@ def fused_bias_snake_beta(
         VECTOR_ELEMENTS=vector_elements,
         num_warps=VECTORS_PER_PROGRAM // 32,
         enable_fp_fusion=False,
-        enable_reflect_ftz=False,
+        # Intel's Triton backend rejects the CUDA-only option.
+        **({"enable_reflect_ftz": False} if conv_output.is_cuda else {}),
     )

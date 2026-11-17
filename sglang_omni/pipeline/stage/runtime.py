@@ -41,6 +41,7 @@ from sglang_omni.pipeline.tp_control import (
     TPWorkMessage,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler import thread_hook
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
@@ -2688,7 +2689,13 @@ class Stage:
 
     def on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
+        if msg.enable_torch and thread_hook.TARGET_STAGE:
+            if self.name == thread_hook.TARGET_STAGE:
+                base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
+                thread_hook.PENDING = ("start", f"{base_tpl}_pid{os.getpid()}", run_id)
+            else:
+                pass
+        elif msg.enable_torch and not TorchProfiler.is_active():
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
@@ -2718,7 +2725,12 @@ class Stage:
 
     def on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
+        if thread_hook.TARGET_STAGE:
+            if self.name == thread_hook.TARGET_STAGE:
+                thread_hook.PENDING = ("stop", msg.run_id)
+            else:
+                pass
+        elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
             TorchProfiler.stop(run_id=msg.run_id)

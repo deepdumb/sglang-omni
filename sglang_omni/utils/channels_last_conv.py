@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -11,7 +13,15 @@ from sglang_omni.platforms import current_platform
 
 def is_channels_last_conv_device(device: torch.device) -> bool:
     """Channels-last convs run only on NVIDIA CUDA, the platform they are measured on."""
-    return current_platform.is_cuda() and device.type == "cuda"
+    if current_platform.is_cuda():
+        return device.type == "cuda"
+    else:
+        # Opt-in on XPU (experimental), see incremental_codec.XPU_FUSED_CODEC.
+        return (
+            current_platform.is_xpu()
+            and device.type == "xpu"
+            and "conv" in os.environ.get("SGLANG_OMNI_XPU_FUSED_CODEC", "").split(",")
+        )
 
 
 def channels_last_strides(weight: torch.Tensor) -> torch.Tensor:

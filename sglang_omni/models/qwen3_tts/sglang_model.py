@@ -55,6 +55,7 @@ from sglang_omni.models.qwen3_tts.cutedsl.runtime import (
 )
 from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
+    on_kernel_device,
     short_cache_gqa_npu,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
@@ -2171,7 +2172,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         max_top_k = int(self.sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self.sub_sampled_has_unbounded_top_k)
 
-        if logits.is_cuda:
+        if on_kernel_device(logits):
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
                 logits,
                 temperatures,

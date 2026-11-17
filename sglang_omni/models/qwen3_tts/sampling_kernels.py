@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang_omni.models.qwen3_tts.predictor_kernels import (
     codec_gather_projected_size,
     gather_codec_embedding_row_and_add,
+    on_kernel_device,
 )
 from sglang_omni.platforms import current_platform
 
@@ -839,10 +840,10 @@ def sample_from_sorted_logprobs_with_seed_small_k(
 
     if (
         seeded_gumbel_sample_sorted_kernel is None
-        or not logprobs.is_cuda
-        or not sorted_idx.is_cuda
-        or not seeds.is_cuda
-        or not positions.is_cuda
+        or not on_kernel_device(logprobs)
+        or not on_kernel_device(sorted_idx)
+        or not on_kernel_device(seeds)
+        or not on_kernel_device(positions)
     ):
         return None
     else:
@@ -914,7 +915,7 @@ def fused_sampler_block_k(
         seeded_top_k_top_p_sample_kernel is None
         or not _TRITON_GATHER_SUPPORTED
         or block_k is None
-        or not logits.is_cuda
+        or not on_kernel_device(logits)
         or logits.ndim != 2
         or logits.shape[1] != FUSED_SAMPLER_VOCAB_SIZE
         or logits.dtype is not torch.bfloat16
@@ -953,7 +954,8 @@ def uses_split_top_k(logits: torch.Tensor, max_top_k: int, block_k: int) -> bool
     # note (ratish): the split launch is measured on sm_90 only; other devices keep
     # the single kernel. Each chunk holds at least two runs, so it runs a halving round.
     return (
-        max_top_k > 32
+        logits.is_cuda
+        and max_top_k > 32
         and TOP_K_CHUNKS * block_k < FUSED_SAMPLER_VOCAB_SIZE
         and torch.version.hip is None
         and torch.cuda.get_device_capability(logits.device) == (9, 0)

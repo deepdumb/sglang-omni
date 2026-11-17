@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
 import numpy as np
 import numpy.typing as npt
+import os
+
 import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
@@ -28,6 +30,18 @@ from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
 )
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSPromptConstants
 from sglang_omni.platforms import current_platform
+
+# XPU: reference clips are encoded in whole buckets of this many frames (12.5 per second),
+# warmed at startup up to XPU_REFERENCE_WARM_FRAMES; 1 turns the buckets off.
+XPU_REFERENCE_BUCKET_FRAMES = int(
+    os.environ.get("SGLANG_OMNI_XPU_REFERENCE_BUCKET_FRAMES", 25)
+)
+XPU_REFERENCE_PRIVATE_STREAM = (
+    os.environ.get("SGLANG_OMNI_XPU_REFERENCE_PRIVATE_STREAM", "") == "1"
+)
+XPU_REFERENCE_WARM_FRAMES = int(
+    os.environ.get("SGLANG_OMNI_XPU_REFERENCE_WARM_FRAMES", 375)
+)
 from sglang_omni.preprocessing.cache_key import PromptRowCacheKeys
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
@@ -974,6 +988,11 @@ class Qwen3TTSAdhocReferenceInput:
 def new_encode_stream(device: torch.device) -> torch.Stream | None:
     if not supports_device_streams(device):
         return None
+    elif device.type == "xpu" and not XPU_REFERENCE_PRIVATE_STREAM:
+        # torch 2.14.0+xpu: inside the server, work queued on a private stream by the
+        # reference thread never drains (Event and Stream synchronize both block), so
+        # the encode runs on the thread's default stream.
+        return None
     else:
         pass
     return torch.get_device_module(device).Stream(device=device)
@@ -1031,6 +1050,10 @@ class Qwen3TTSRefCodeBatcher:
                 )
         else:
             pass
+        if self.encoder_device.type == "xpu" and XPU_REFERENCE_BUCKET_FRAMES > 1:
+            self.warm_xpu_buckets()
+        else:
+            pass
         self.queue: queue.Queue[object] = queue.Queue()
         self.thread = threading.Thread(
             target=self.run,
@@ -1038,6 +1061,40 @@ class Qwen3TTSRefCodeBatcher:
             daemon=True,
         )
         self.thread.start()
+
+    def warm_xpu_buckets(self) -> None:
+        """Encode one clip of every bucketed length up to XPU_REFERENCE_WARM_FRAMES."""
+        start = time.perf_counter()
+        lengths = range(
+            XPU_REFERENCE_BUCKET_FRAMES,
+            XPU_REFERENCE_WARM_FRAMES + 1,
+            XPU_REFERENCE_BUCKET_FRAMES,
+        )
+        with torch.inference_mode():
+            for frames in lengths:
+                values = torch.zeros(
+                    (1, 1, frames * self.hop),
+                    device=self.encoder_device,
+                    dtype=self.encoder_dtype,
+                )
+                # A full bucket and a partly filled one take different shapes at the
+                # exact-length hooks, so both are encoded.
+                for samples in (frames * self.hop, frames * self.hop - self.hop // 2):
+                    self.clip_samples.fill_(samples)
+                    with exact_length_encode(self.encoder, self.clip_samples):
+                        self.encoder.encode(
+                            values,
+                            num_quantizers=self.num_quantizers,
+                            return_dict=True,
+                        )
+        torch.xpu.synchronize(self.encoder_device)
+        logger.info(
+            "Qwen3-TTS reference encoder XPU length buckets warmed: %d shapes of "
+            "%d-frame steps in %.1f s",
+            len(lengths),
+            XPU_REFERENCE_BUCKET_FRAMES,
+            time.perf_counter() - start,
+        )
 
     def close(self) -> None:
         self.queue.put(_QWEN3_TTS_REF_CODE_BATCH_STOP)
@@ -1091,7 +1148,12 @@ class Qwen3TTSRefCodeBatcher:
         # finish so consumer threads may use the codes on any stream. Waiting
         # on the dedicated stream's event leaves the default stream, where
         # speaker-embedding kernels run concurrently, untouched.
-        if self.encode_stream is not None:
+        if self.encode_stream is not None and self.encoder_device.type == "xpu":
+            # torch 2.14.0+xpu: an Event recorded on the encode stream never completes
+            # once the server's other threads are running; wait on the stream itself.
+            self.encode_stream.synchronize()
+            return
+        elif self.encode_stream is not None:
             handoff = torch.get_device_module(self.encoder_device).Event()
             handoff.record(self.encode_stream)
             handoff.synchronize()
@@ -1134,6 +1196,13 @@ class Qwen3TTSRefCodeBatcher:
         ):
             largest_frames = self.graph_runner.bucket_frames[-1]
             padded_frames = -(-frames // largest_frames) * largest_frames
+        elif self.encoder_device.type == "xpu" and XPU_REFERENCE_BUCKET_FRAMES > 1:
+            # oneDNN builds a kernel per conv input shape (about 0.5 s per new clip
+            # length); whole buckets keep the shapes to a warmed few. The exact-length
+            # hooks make the padded encode return the same codes.
+            padded_frames = (
+                -(-frames // XPU_REFERENCE_BUCKET_FRAMES) * XPU_REFERENCE_BUCKET_FRAMES
+            )
         else:
             padded_frames = frames
         values = torch.zeros(

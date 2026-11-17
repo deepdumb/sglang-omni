@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sglang_omni.platforms import current_platform
@@ -14,6 +16,17 @@ except ImportError:  # pragma: no cover - depends on runtime image
     triton = None
     tl = None
 
+
+# Opt-in on XPU (experimental): run the fused sampler and codec-gather kernels there.
+XPU_FUSED_SAMPLER = (
+    current_platform.is_xpu()
+    and os.environ.get("SGLANG_OMNI_XPU_FUSED_SAMPLER", "") == "1"
+)
+
+
+def on_kernel_device(tensor: torch.Tensor) -> bool:
+    """CUDA, or XPU when the fused sampler kernels are opted in."""
+    return tensor.is_cuda or (XPU_FUSED_SAMPLER and tensor.device.type == "xpu")
 
 def has_triton_runtime() -> bool:
     return triton is not None and not current_platform.is_npu()
@@ -139,7 +152,11 @@ def codec_gather_projected_size(
         return None
     else:
         pass
-    if not (embedding_weight.is_cuda and gathered.is_cuda and accumulated.is_cuda):
+    if not (
+        on_kernel_device(embedding_weight)
+        and on_kernel_device(gathered)
+        and on_kernel_device(accumulated)
+    ):
         return None
     else:
         pass
@@ -241,7 +258,7 @@ def gather_codec_embedding_and_add(
     else:
         pass
     if not (
-        token_ids.is_cuda
+        on_kernel_device(token_ids)
         and token_ids.ndim == 1
         and token_ids.dtype in (torch.int32, torch.int64)
         and token_ids.is_contiguous()
