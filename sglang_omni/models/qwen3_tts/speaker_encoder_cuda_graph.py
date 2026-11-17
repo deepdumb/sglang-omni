@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -185,6 +186,7 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         self.graphs: dict[int, CapturedSpeakerEncoderGraph] = {}
         self.bucket_frames: list[int] = []
         self.disable_reason: str | None = None
+        self.uses_eager_buckets = False
         self.replays = 0
         self.misses = 0
 
@@ -205,6 +207,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             return
         elif not supports_device_streams(param.device) or graph_backend is None:
             self.disable_reason = f"no graph backend on {param.device.type}"
+            return
+        elif param.device.type == "xpu":
+            # note (jagdish): on XPU these captures leave the reference-code thread's later device work unfinished, so the first voice-clone request times out; clips run eager at the ladder's widths instead.
+            self.disable_reason = "graphs are off on xpu"
+            self.warm_eager_buckets(param)
             return
         else:
             pass
@@ -276,6 +283,30 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             pass
         logger.info(f"Qwen3-TTS speaker encoder graphs captured for {buckets} frames")
 
+    def warm_eager_buckets(self, param: torch.nn.Parameter) -> None:
+        """Encode a full and a partly filled clip of every ladder width once, so no
+        request pays for building their kernels."""
+        start = time.perf_counter()
+        with torch.inference_mode(), device_guard(param.device):
+            for width in self.bucket_frames:
+                mels = torch.zeros(
+                    (1, self.mel_basis.shape[0], width),
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                for frames in (width, width - 1):
+                    encode_bucketed(
+                        self.encoder,
+                        mels,
+                        torch.full((1,), frames, device=param.device),
+                        self.pads,
+                    )
+        self.uses_eager_buckets = True
+        logger.info(
+            f"Qwen3-TTS speaker encoder XPU buckets warmed: widths "
+            f"{self.bucket_frames} in {time.perf_counter() - start:.1f} s"
+        )
+
     def stats(self) -> ReferenceEncoderGraphStats:
         return {
             "enabled": bool(self.graphs),
@@ -310,6 +341,29 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             return encode_bucketed(
                 self.encoder,
                 mels.to(param.dtype),
+                torch.full((1,), frames, device=param.device),
+                self.pads,
+            )
+        elif bucket is None and self.uses_eager_buckets:
+            largest_frames = self.bucket_frames[-1]
+            width = next(
+                (
+                    bucket_width
+                    for bucket_width in self.bucket_frames
+                    if bucket_width >= frames
+                ),
+                -(-frames // largest_frames) * largest_frames,
+            )
+            mels = self.mel(samples)
+            padded_mels = torch.zeros(
+                (1, mels.shape[1], width), device=param.device, dtype=param.dtype
+            )
+            padded_mels[:, :, :frames].copy_(mels)
+            with self.lock:
+                self.misses += 1
+            return encode_bucketed(
+                self.encoder,
+                padded_mels,
                 torch.full((1,), frames, device=param.device),
                 self.pads,
             )

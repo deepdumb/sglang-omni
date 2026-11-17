@@ -57,6 +57,10 @@ from sglang_omni.utils.device import has_device_streams, supports_device_streams
 
 logger = logging.getLogger(__name__)
 
+# note (jagdish): oneDNN builds a kernel per conv input shape, about 0.5 s per new reference length on an Arc Pro B60, so XPU encodes references in whole buckets warmed at startup up to 30 s.
+XPU_REFERENCE_BUCKET_FRAMES = 25
+XPU_REFERENCE_WARM_FRAMES = 375
+
 if TYPE_CHECKING:
     from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 
@@ -1047,6 +1051,10 @@ class Qwen3TTSRefCodeBatcher:
                 )
         else:
             pass
+        if self.encoder_device.type == "xpu":
+            self.warm_reference_buckets()
+        else:
+            pass
         self.queue: queue.Queue[object] = queue.Queue()
         self.thread = threading.Thread(
             target=self.run,
@@ -1054,6 +1062,40 @@ class Qwen3TTSRefCodeBatcher:
             daemon=True,
         )
         self.thread.start()
+
+    def warm_reference_buckets(self) -> None:
+        """Encode a full and a partly filled clip of every bucketed width once."""
+        start = time.perf_counter()
+        bucket_widths = range(
+            XPU_REFERENCE_BUCKET_FRAMES,
+            XPU_REFERENCE_WARM_FRAMES + 1,
+            XPU_REFERENCE_BUCKET_FRAMES,
+        )
+        with torch.inference_mode():
+            for frames in bucket_widths:
+                waveform = torch.zeros(
+                    (1, 1, frames * self.hop),
+                    device=self.encoder_device,
+                    dtype=self.encoder_dtype,
+                )
+                # A partly filled bucket takes other shapes at the exact-length hooks.
+                for clip_samples in (
+                    frames * self.hop,
+                    frames * self.hop - self.hop // 2,
+                ):
+                    self.clip_samples.fill_(clip_samples)
+                    with exact_length_encode(self.encoder, self.clip_samples):
+                        self.encoder.encode(
+                            waveform,
+                            num_quantizers=self.num_quantizers,
+                            return_dict=True,
+                        )
+        torch.xpu.synchronize(self.encoder_device)
+        logger.info(
+            f"Qwen3-TTS reference encoder XPU buckets warmed: {len(bucket_widths)} "
+            f"widths of {XPU_REFERENCE_BUCKET_FRAMES} frames in "
+            f"{time.perf_counter() - start:.1f} s"
+        )
 
     def close(self) -> None:
         self.queue.put(_QWEN3_TTS_REF_CODE_BATCH_STOP)
@@ -1150,6 +1192,10 @@ class Qwen3TTSRefCodeBatcher:
         ):
             largest_frames = self.graph_runner.bucket_frames[-1]
             padded_frames = -(-frames // largest_frames) * largest_frames
+        elif self.encoder_device.type == "xpu":
+            padded_frames = (
+                -(-frames // XPU_REFERENCE_BUCKET_FRAMES) * XPU_REFERENCE_BUCKET_FRAMES
+            )
         else:
             padded_frames = frames
         values = torch.zeros(
